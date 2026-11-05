@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>iPad Serial Scanner</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+               font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; }
+  .wrap { position: fixed; inset: 0; display: flex; flex-direction: column; }
+  video { flex: 1; min-height: 0; width: 100%; object-fit: cover; background: #000; }
+  .frame { position: absolute; top: 42%; left: 50%; width: 62vmin; height: 62vmin; transform: translate(-50%, -50%);
+           border: 3px solid #fff; border-radius: 18px; box-shadow: 0 0 0 9999px rgba(0,0,0,.35); pointer-events: none; }
+  .frame.hit { border-color: #3ddc84; }
+  .bar { padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); text-align: center; font-size: 17px; line-height: 1.4; }
+  button { display: block; width: 100%; margin-top: 12px; border: 0; border-radius: 12px; padding: 15px;
+           font-size: 18px; font-weight: 700; background: #fff; color: #000; }
+  .err { color: #ffb4a8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <div class="frame" id="frame"></div>
+  <div class="bar">
+    <div id="msg">Starting camera…</div>
+    <button type="button" id="cancel">Cancel</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script>
+  // This page only reads the QR code and sends the serial back to the Apps Script form.
+  // It stores nothing and talks to no server.
+  const SERIAL_RE = /^[A-Z0-9]{10,12}$/;
+  const msg = document.getElementById('msg');
+  const v = document.getElementById('v');
+  let stream = null, timer = null;
+
+  // Only ever send people back to a Google Apps Script web app.
+  const back = (() => {
+    try {
+      const u = new URL(new URLSearchParams(location.search).get('return') || '');
+      return u.protocol === 'https:' && u.hostname === 'script.google.com' ? u : null;
+    } catch (e) { return null; }
+  })();
+
+  function returnUrl(serial) {
+    const u = new URL(back.href);
+    if (serial) u.searchParams.set('serial', serial);
+    return u.href;
+  }
+
+  function goBack(serial) {
+    stop();
+    if (!back) { msg.textContent = serial ? 'Serial: ' + serial : 'Closed.'; return; }
+    location.replace(returnUrl(serial));
+  }
+
+  function stop() {
+    clearTimeout(timer);
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  }
+
+  function serialFromQR(raw) {
+    const t = raw.trim().toUpperCase();
+    if (SERIAL_RE.test(t)) return t;
+    const tokens = t.match(/\b[A-Z0-9]{10,12}\b/g) || [];
+    return tokens.find(x => /\d/.test(x) && /[A-Z]/.test(x)) || '';
+  }
+
+  async function start() {
+    if (!back) {
+      msg.innerHTML = '<span class="err">Open this from the iPad Issue Logger form.</span>';
+      return;
+    }
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+      msg.innerHTML = '<span class="err">This browser can\'t use the live camera. Go back and use "take a photo".</span>';
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+    } catch (e) {
+      msg.innerHTML = '<span class="err">Camera access was blocked. Allow the camera for this site in your browser settings, or go back and use "take a photo".</span>';
+      return;
+    }
+    v.srcObject = stream;
+    try { await v.play(); } catch (e) {}
+    msg.textContent = 'Point at the lock screen QR code';
+
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    const tick = () => {
+      if (!stream) return;
+      if (v.readyState >= 2 && v.videoWidth) {
+        const k = Math.min(1, 800 / Math.max(v.videoWidth, v.videoHeight));
+        c.width = Math.round(v.videoWidth * k);
+        c.height = Math.round(v.videoHeight * k);
+        ctx.drawImage(v, 0, 0, c.width, c.height);
+        const d = ctx.getImageData(0, 0, c.width, c.height);
+        const code = jsQR(d.data, c.width, c.height, { inversionAttempts: 'attemptBoth' });
+        if (code && code.data) {
+          const serial = serialFromQR(code.data);
+          if (SERIAL_RE.test(serial)) {
+            document.getElementById('frame').classList.add('hit');
+            msg.textContent = 'Got it: ' + serial;
+            if (navigator.vibrate) navigator.vibrate(80);
+            return goBack(serial);
+          }
+          msg.textContent = "That QR code isn't an iPad serial. Aim at the lock screen code.";
+        }
+      }
+      timer = setTimeout(tick, 120);
+    };
+    tick();
+  }
+
+  document.getElementById('cancel').onclick = () => goBack('');
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else if (!stream && back) start(); });
+  start();
+</script>
+</body>
+</html>
