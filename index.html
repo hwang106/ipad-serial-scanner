@@ -55,6 +55,18 @@
 
   function goBack(serial) {
     stop();
+    // Fast path: the form opened us in a new tab and is still open.
+    // Hand it the serial directly and close this tab, so the form never reloads.
+    if (window.opener && !window.opener.closed) {
+      try {
+        if (serial) window.opener.postMessage({ type: 'ipad-serial', serial }, '*');
+        window.close();
+        // If the browser refuses to close the tab, at least say where to go.
+        setTimeout(() => { msg.textContent = serial ? 'Got it. Switch back to the form tab.' : 'Closed. Switch back to the form tab.'; }, 400);
+        return;
+      } catch (e) {}
+    }
+    // Slow path: reload the form with ?serial=
     if (!back) { msg.textContent = serial ? 'Serial: ' + serial : 'Closed.'; return; }
     location.replace(returnUrl(serial));
   }
