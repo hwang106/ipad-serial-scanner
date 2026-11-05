@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>iPad Serial Scanner</title>
+<title>Device Serial Scanner</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -13,11 +13,17 @@
   video { flex: 1; min-height: 0; width: 100%; object-fit: cover; background: #000; }
   .frame { position: absolute; top: 42%; left: 50%; width: 62vmin; height: 62vmin; transform: translate(-50%, -50%);
            border: 3px solid #fff; border-radius: 18px; box-shadow: 0 0 0 9999px rgba(0,0,0,.35); pointer-events: none; }
+  .frame.wide { width: 86vw; height: 24vh; border-radius: 12px; }
   .frame.hit { border-color: #3ddc84; }
   .bar { padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); text-align: center; font-size: 17px; line-height: 1.4; }
   button { display: block; width: 100%; margin-top: 12px; border: 0; border-radius: 12px; padding: 15px;
            font-size: 18px; font-weight: 700; background: #fff; color: #000; }
+  button.primary { background: #3ddc84; }
+  button.dim { background: #333; color: #fff; }
+  .read { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 28px; letter-spacing: 2px;
+          margin: 4px 0 8px; word-break: break-all; }
   .err { color: #ffb4a8; }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
@@ -26,30 +32,43 @@
   <div class="frame" id="frame"></div>
   <div class="bar">
     <div id="msg">Starting camera…</div>
+    <div id="confirm" class="hidden">
+      <div class="read" id="readVal"></div>
+      <div>Does this match the <b>S/N</b> printed on the label?</div>
+      <button type="button" class="primary" id="useIt">Yes, use this</button>
+      <button type="button" class="dim" id="again">No, keep scanning</button>
+    </div>
     <button type="button" id="cancel">Cancel</button>
   </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <script>
-  // This page only reads the QR code and sends the serial back to the Apps Script form.
-  // It stores nothing and talks to no server.
-  const SERIAL_RE = /^[A-Z0-9]{10,12}$/;
-  const msg = document.getElementById('msg');
-  const v = document.getElementById('v');
-  let stream = null, timer = null;
+  // Reads a serial with the camera and hands it back to the Apps Script form.
+  // Stores nothing and talks to no server.
+  //   default:       iPad lock screen QR code (accepted automatically)
+  //   ?mode=barcode: Chromebook S/N barcode (teacher confirms it matches the printed S/N)
+  const params = new URLSearchParams(location.search);
+  const MODE = params.get('mode') === 'barcode' ? 'barcode' : 'qr';
+  const DEVICE = MODE === 'barcode' ? 'chromebook' : 'ipad';
+  const IPAD_RE = /^[A-Z0-9]{10,12}$/;
+  const CB_RE = /^[A-Z0-9]{5,25}$/;
+  const $ = id => document.getElementById(id);
+  const msg = $('msg'), v = $('v');
+  let stream = null, timer = null, paused = false;
+  const rejected = new Set();   // barcodes the teacher said aren't the S/N
 
   // Only ever send people back to a Google Apps Script web app.
   const back = (() => {
     try {
-      const u = new URL(new URLSearchParams(location.search).get('return') || '');
+      const u = new URL(params.get('return') || '');
       return u.protocol === 'https:' && u.hostname === 'script.google.com' ? u : null;
     } catch (e) { return null; }
   })();
 
   function returnUrl(serial) {
     const u = new URL(back.href);
-    if (serial) u.searchParams.set('serial', serial);
+    if (serial) { u.searchParams.set('serial', serial); u.searchParams.set('device', DEVICE); }
     return u.href;
   }
 
@@ -59,7 +78,7 @@
     // Hand it the serial directly and close this tab, so the form never reloads.
     if (window.opener && !window.opener.closed) {
       try {
-        if (serial) window.opener.postMessage({ type: 'ipad-serial', serial }, '*');
+        if (serial) window.opener.postMessage({ type: 'ipad-serial', serial, device: DEVICE }, '*');
         window.close();
         // If the browser refuses to close the tab, at least say where to go.
         setTimeout(() => { msg.textContent = serial ? 'Got it. Switch back to the form tab.' : 'Closed. Switch back to the form tab.'; }, 400);
@@ -76,63 +95,146 @@
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   }
 
+  /* ---------- iPad: lock screen QR ---------- */
   function serialFromQR(raw) {
     const t = raw.trim().toUpperCase();
-    if (SERIAL_RE.test(t)) return t;
+    if (IPAD_RE.test(t)) return t;
     const tokens = t.match(/\b[A-Z0-9]{10,12}\b/g) || [];
     return tokens.find(x => /\d/.test(x) && /[A-Z]/.test(x)) || '';
   }
 
+  function scanQr(canvas, ctx) {
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(d.data, canvas.width, canvas.height, { inversionAttempts: 'attemptBoth' });
+    if (!code || !code.data) return;
+    const serial = serialFromQR(code.data);
+    if (IPAD_RE.test(serial)) {
+      $('frame').classList.add('hit');
+      msg.textContent = 'Got it: ' + serial;
+      if (navigator.vibrate) navigator.vibrate(80);
+      goBack(serial);
+      return true;
+    }
+    msg.textContent = "That QR code isn't an iPad serial. Aim at the lock screen code.";
+  }
+
+  /* ---------- Chromebook: S/N barcode ---------- */
+  let barcodeReader = null;
+  function loadZxing() {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+      s.onload = resolve; s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+
+  function makeBarcodeReader() {
+    const Z = window.ZXing, F = Z.BarcodeFormat;
+    const hints = new Map();
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS,
+      [F.CODE_128, F.CODE_39, F.CODE_93, F.CODABAR, F.ITF, F.EAN_13, F.UPC_A, F.DATA_MATRIX, F.QR_CODE]);
+    hints.set(Z.DecodeHintType.TRY_HARDER, true);
+    const r = new Z.MultiFormatReader();
+    r.setHints(hints);
+    return r;
+  }
+
+  function decodeBarcode(canvas) {
+    const Z = window.ZXing;
+    try {
+      const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(canvas)));
+      return barcodeReader.decodeWithState(bmp).getText();
+    } catch (e) { return null; }   // "not found" is thrown on every frame without a barcode
+    finally { barcodeReader.reset(); }
+  }
+
+  function scanBarcode(canvas) {
+    const raw = decodeBarcode(canvas);
+    if (!raw) return;
+    const s = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!CB_RE.test(s) || rejected.has(s)) return;
+    // Labels often have several barcodes, so ask before using it.
+    paused = true;
+    $('frame').classList.add('hit');
+    if (navigator.vibrate) navigator.vibrate(60);
+    $('readVal').textContent = s;
+    msg.classList.add('hidden');
+    $('confirm').classList.remove('hidden');
+    return true;
+  }
+
+  $('useIt').onclick = () => goBack($('readVal').textContent);
+  $('again').onclick = () => {
+    rejected.add($('readVal').textContent);
+    $('confirm').classList.add('hidden');
+    msg.classList.remove('hidden');
+    msg.textContent = 'OK, aim at a different barcode on the label.';
+    $('frame').classList.remove('hit');
+    paused = false;
+  };
+
+  /* ---------- Camera loop ---------- */
   async function start() {
     if (!back) {
-      msg.innerHTML = '<span class="err">Open this from the iPad Issue Logger form.</span>';
+      msg.innerHTML = '<span class="err">Open this from the Device Issue Logger form.</span>';
       return;
     }
     if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
-      msg.innerHTML = '<span class="err">This browser can\'t use the live camera. Go back and use "take a photo".</span>';
+      msg.innerHTML = '<span class="err">This browser can\'t use the live camera. Go back and use the photo option.</span>';
       return;
+    }
+    if (MODE === 'barcode' && !barcodeReader) {
+      try { await loadZxing(); barcodeReader = makeBarcodeReader(); }
+      catch (e) { msg.innerHTML = '<span class="err">Couldn\'t load the barcode reader. Check your connection, or go back and use the photo option.</span>'; return; }
     }
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: MODE === 'barcode'
+          // Small label barcodes need more resolution than the iPad QR code.
+          ? { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+          : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
     } catch (e) {
-      msg.innerHTML = '<span class="err">Camera access was blocked. Allow the camera for this site in your browser settings, or go back and use "take a photo".</span>';
+      msg.innerHTML = '<span class="err">Camera access was blocked. Allow the camera for this site in your browser settings, or go back and use the photo option.</span>';
       return;
     }
     v.srcObject = stream;
     try { await v.play(); } catch (e) {}
-    msg.textContent = 'Point at the lock screen QR code';
+    msg.textContent = MODE === 'barcode'
+      ? 'Line up the S/N barcode inside the box. Hold steady, about a hand-width away.'
+      : 'Point at the lock screen QR code';
 
     const c = document.createElement('canvas');
     const ctx = c.getContext('2d', { willReadFrequently: true });
     const tick = () => {
       if (!stream) return;
-      if (v.readyState >= 2 && v.videoWidth) {
-        const k = Math.min(1, 800 / Math.max(v.videoWidth, v.videoHeight));
-        c.width = Math.round(v.videoWidth * k);
-        c.height = Math.round(v.videoHeight * k);
-        ctx.drawImage(v, 0, 0, c.width, c.height);
-        const d = ctx.getImageData(0, 0, c.width, c.height);
-        const code = jsQR(d.data, c.width, c.height, { inversionAttempts: 'attemptBoth' });
-        if (code && code.data) {
-          const serial = serialFromQR(code.data);
-          if (SERIAL_RE.test(serial)) {
-            document.getElementById('frame').classList.add('hit');
-            msg.textContent = 'Got it: ' + serial;
-            if (navigator.vibrate) navigator.vibrate(80);
-            return goBack(serial);
-          }
-          msg.textContent = "That QR code isn't an iPad serial. Aim at the lock screen code.";
+      if (!paused && v.readyState >= 2 && v.videoWidth) {
+        const W = v.videoWidth, H = v.videoHeight;
+        let done;
+        if (MODE === 'barcode') {
+          // Crop the middle band (where the aiming box is) at full resolution: thin bars need the detail.
+          const cw = Math.round(W * 0.9), ch = Math.round(H * 0.45);
+          const k = Math.min(1, 1400 / cw);
+          c.width = Math.round(cw * k); c.height = Math.round(ch * k);
+          ctx.drawImage(v, (W - cw) / 2, (H - ch) / 2, cw, ch, 0, 0, c.width, c.height);
+          done = scanBarcode(c);
+        } else {
+          const k = Math.min(1, 800 / Math.max(W, H));
+          c.width = Math.round(W * k); c.height = Math.round(H * k);
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+          done = scanQr(c, ctx);
         }
+        if (done && MODE === 'qr') return;
       }
-      timer = setTimeout(tick, 120);
+      timer = setTimeout(tick, MODE === 'barcode' ? 150 : 120);
     };
     tick();
   }
 
-  document.getElementById('cancel').onclick = () => goBack('');
+  if (MODE === 'barcode') { $('frame').classList.add('wide'); document.title = 'Chromebook S/N Scanner'; }
+  $('cancel').onclick = () => goBack('');
   document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else if (!stream && back) start(); });
   start();
 </script>
